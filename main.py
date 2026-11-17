@@ -1,53 +1,64 @@
 """Forecast launch-day Twitch viewers, hour by hour, for one case.
 
-The program reads every ``*.in`` case file in the input directory and writes
-one ``<id>.out`` forecast per case: 23 rows, hours 2 to 24, each with five
-quantiles of that hour's concurrent-viewer count at the levels
+Round 2. The program reads every ``*.in`` case file in the input directory
+and writes one ``<id>.out`` forecast per case: 23 rows, hours 2 to 24, each
+with five quantiles of that hour's concurrent-viewer count at the levels
 0.05, 0.25, 0.5, 0.75 and 0.95.
 
 Method
 ------
-The case anchors on its hour-1 print ``p1``.  What varies between launches is
+The case anchors on its hour-1 print ``p1``. What varies between launches is
 not the level but the *shape* of the day: how the count moves away from hour 1
 as regions unlock at their local midnight and as the day's prime time arrives.
 Past big launches in the case's ``comparables`` show that shape, so each
 hour's forecast is built from their log-ratios ``ln(viewers_h / viewers_1)``.
 
-Not every past launch is an equally good guide for this one.  Two launches
-resemble each other when they behaved the same way in their first hour, so
-each comparable is weighted by how close it sits to this case on three
-measures of that first hour:
+The shape depends most on sheer scale: the bigger hour 1 already is, the
+less room the day has left to grow. Across the kit's past launches the
+correlation of a launch's median log-ratio with ``ln(p1)`` is about -0.82,
+and with its peak log-ratio about -0.94. A mega launch's day decays from an
+already huge hour 1 and recovers toward it in the evening; a small launch's
+day explodes a hundredfold as the world wakes up. So the median log-ratio
+for each hour blends two views of that scale dependence:
 
-* ``hype`` -- how far hour 1 jumped above the category's own quiet level in
-  the three days before release day, ``ln(p1 / pre_median)``.  A launch that
-  was already live in big regions by hour 1 jumps far; one that unlocks later
-  in the UTC day barely moves yet, and its day then explodes.
-* ``size`` -- the sheer scale of hour 1, ``ln(p1)``.  Mega launches hold
-  their audience through the day differently from mid-size ones.
+* a local-linear fit in ``ln(p1)`` (Gaussian kernel, bandwidth 2.0 log
+  units): a line through the pool's log-ratios, read at this case's own
+  scale. Unlike a weighted average it extrapolates past the biggest past
+  launch, which is where a record launch like this one sits;
+* the round-1 kernel estimate: a Gaussian kernel over likeness in hype
+  (``ln(p1 / pre_median)``) and size (bandwidth 1.2 each), blending the
+  weighted empirical median (30%) with the weighted mean (70%).
 
-The weight is a Gaussian kernel over those two distances (bandwidth 1.2 log
-units each).  Each hour's five quantiles blend two views of the weighted
-log-ratios for that hour: the weighted empirical quantiles (which keep the
-real shape, including the long upper tail -- some launches explode later in
-the day) and a weighted normal fit (which steadies the far tails, where only
-a few launches vote).  The blend is 30% empirical, 70% normal, in log
-space, then multiplied back by ``p1``.  Nothing is fitted to the target
-case's own future: every number comes from past launches.
+The blend is 70% local-linear, 30% kernel. Hype on its own adds nothing
+once scale is fitted -- it is nearly the same signal (correlation 0.91 with
+the pre-midnight ramp) -- and extra features only add variance, so the
+median uses scale alone.
 
-Backtests on the kit's practice comparables (each launch held out in turn and
-forecast from the rest) put this at a mean pinball loss around 0.36 on clean
-launches -- launches whose hour 1 already caught a major unlock -- and around
-0.40 over all launches, against about 0.55 and 0.93 for flat persistence at
-hour 1 with a widening spread.  It beats persistence on 17 of the 19 clean
-launches and 28 of 37 launches overall.
+The spread is calibrated, not assumed. Every past launch is forecast in
+turn from the rest of the pool (leave-one-out), and the misses are kept as
+residuals. For this case each hour's spread is the standard deviation of
+those residuals, weighted toward launches of a similar scale (Gaussian
+kernel on ``ln(p1)``, bandwidth 1.5). A big launch's spread comes from big
+launches, whose days are predictable; a small launch's spread comes from
+small launches, whose days are not. The five quantiles are the median plus
+the standard normal quantiles times that spread, in log space, then
+multiplied back by ``p1``.
+
+Backtests on the kit's practice comparables (each launch held out in turn
+and forecast from the rest, 37 launches) put this at a mean pinball loss
+around 0.37 overall and 0.14 on the biggest launches, against 0.40 and 0.16
+for the round-1 entry and 0.93 for flat persistence; 90% coverage is 0.90,
+where round 1 covered 0.87 on the same backtest. Nothing is fitted to the
+target case's own future: every number comes from past launches.
 
 Fallbacks keep every case valid: a comparable without a usable hour 1, or
 without a pre-launch level, is left out of the pool; a target without a
-pre-launch level simply drops that distance and leans on the ones it has; an
-hour with no pool at all falls back to flat persistence with a wide spread.
+pre-launch level simply drops that distance and leans on the ones it has;
+an hour with no pool at all falls back to flat persistence with a wide
+spread; an hour with too few residuals falls back to the pool's own spread.
 
 The program is deterministic: no clock, no randomness, no network, no
-environment-dependent ordering.  It uses only the Python standard library.
+environment-dependent ordering. It uses only the Python standard library.
 """
 
 import json
@@ -66,16 +77,26 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles at the scored levels.
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
      0.6744897501960817, 1.6448536269514722]
-# Kernel bandwidths (log units) for the two likeness measures.
-BANDWIDTH = {"hype": 1.2, "size": 1.2}
-# Share of the weighted empirical quantiles in the final blend; the rest is
-# the weighted normal fit.  The empirical part keeps the real (skewed) shape,
-# the normal part steadies the far tails.
+# Kernel bandwidth (log units) of the local-linear fit in ln(p1).
+LOCLIN_BANDWIDTH = 2.0
+# Kernel bandwidths (log units) for the round-1 likeness measures.
+KERNEL_BANDWIDTH = {"hype": 1.2, "size": 1.2}
+# Share of the local-linear median in the final median; the rest is the
+# kernel estimate. The local-linear part extrapolates in scale; the kernel
+# part keeps the estimate anchored to the most similar past launches.
+LOCLIN_SHARE = 0.7
+# Share of the weighted empirical median in the kernel estimate; the rest
+# is the weighted mean.
 EMPIRICAL_SHARE = 0.3
+# Kernel bandwidth (log units) weighting residuals by scale similarity.
+RESIDUAL_BANDWIDTH = 1.5
 # How many days before release day count as the quiet pre-launch level.
 PRE_DAYS = 3
 # Spread of the fallback forecast, in log units per square-root hour.
 FALLBACK_SIGMA = 0.30
+# Floor on the calibrated spread, in log units: with almost no residual
+# variation the quantiles would collapse onto the median.
+MIN_SPREAD = 0.05
 # Output quantiles are rounded to 2 decimals, half up, and clamped here.
 MAX_VIEWERS = 1_000_000_000
 
@@ -148,6 +169,8 @@ def comparable_profile(comp, game_name):
 
     A launch is usable when its release day has a positive hour-1 print and
     at least 20 scored hours.  Its own game is never a guide to itself.
+    The profile carries the log-ratios for each scored hour, so the median
+    and spread fits never re-read the raw points.
     """
     if comp.get("name") == game_name:
         return None
@@ -155,9 +178,10 @@ def comparable_profile(comp, game_name):
     first = hours.get(1)
     if first is None or not first.get("viewers") or first["viewers"] <= 0:
         return None
-    scored = {h: p["viewers"] for h, p in hours.items()
-              if h >= 2 and p.get("viewers") and p["viewers"] > 0}
-    if len(scored) < 20:
+    p1 = first["viewers"]
+    log_ratios = {h: math.log(p["viewers"] / p1) for h, p in hours.items()
+                  if h >= 2 and p.get("viewers") and p["viewers"] > 0}
+    if len(log_ratios) < 20:
         return None
     hourly = comp.get("hourly") or []
     day = day_of(comp["day_start"])
@@ -166,9 +190,10 @@ def comparable_profile(comp, game_name):
     if pre_viewers:
         hype = math.log(first["viewers"] / pre_viewers)
     return {
-        "p1": first["viewers"],
+        "p1": p1,
+        "log_p1": math.log(p1),
         "hype": hype,
-        "day": scored,
+        "log_ratios": log_ratios,
     }
 
 
@@ -198,35 +223,22 @@ def target_profile(case):
             pre_viewers = median_of(older)
     p1 = max(1, known["viewers"])
     hype = math.log(p1 / pre_viewers) if pre_viewers else None
-    return {"p1": p1, "hype": hype}
+    return {"p1": p1, "log_p1": math.log(p1), "hype": hype}
 
 
-def kernel_weight(target, other):
+def kernel_weight(target_log_p1, target_hype, other, bandwidth):
     """Gaussian kernel weight of one comparable for this case.
 
     Distances are taken only over the likeness measures both sides carry;
     a comparable missing a measure the target has does not vote at all.
     """
-    dist2 = 0.0
-    pairs = (
-        (target["hype"], other["hype"], BANDWIDTH["hype"]),
-        (math.log(target["p1"]), math.log(other["p1"]), BANDWIDTH["size"]),
-    )
-    for mine, theirs, width in pairs:
-        if mine is None:
-            continue
-        if theirs is None:
+    dist2 = ((other["log_p1"] - target_log_p1) / bandwidth) ** 2
+    if target_hype is not None:
+        if other["hype"] is None:
             return 0.0
-        dist2 += ((mine - theirs) / width) ** 2
+        dist2 += ((other["hype"] - target_hype)
+                  / KERNEL_BANDWIDTH["hype"]) ** 2
     return math.exp(-0.5 * dist2)
-
-
-def weighted_mean_sd(pairs):
-    """Mean and standard deviation of (value, weight) pairs."""
-    total = sum(w for _, w in pairs)
-    mean = sum(v * w for v, w in pairs) / total
-    var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
-    return mean, math.sqrt(max(var, 1e-9))
 
 
 def weighted_quantile(pairs, tau):
@@ -256,37 +268,151 @@ def weighted_quantile(pairs, tau):
     return marks[-1][1]
 
 
+def kernel_median(target, pool, hour):
+    """Round-1 kernel estimate of one hour's median log-ratio.
+
+    Gaussian kernel over hype and size; the median blends the weighted
+    empirical median (30%) with the weighted mean (70%).
+    """
+    votes = []
+    for other in pool:
+        if hour not in other["log_ratios"]:
+            continue
+        weight = kernel_weight(target["log_p1"], target["hype"], other,
+                               KERNEL_BANDWIDTH["size"])
+        if weight > 0.0:
+            votes.append((other["log_ratios"][hour], weight))
+    if not votes:
+        return None
+    total = sum(w for _, w in votes)
+    mean = sum(v * w for v, w in votes) / total
+    empirical = weighted_quantile(votes, 0.5)
+    return EMPIRICAL_SHARE * empirical + (1.0 - EMPIRICAL_SHARE) * mean
+
+
+def local_linear_median(target, pool, hour):
+    """Local-linear fit of one hour's median log-ratio against ln(p1).
+
+    A weighted least-squares line through the pool's log-ratios, centred
+    on this case's own scale, so the intercept is the prediction.  The line
+    extrapolates past the biggest past launch, where a record launch sits.
+    The slope is shrunk by a small ridge toward the weighted mean.
+    """
+    sum_w = 0.0
+    sum_wd = 0.0
+    sum_wd2 = 0.0
+    sum_wy = 0.0
+    sum_wdy = 0.0
+    for other in pool:
+        ratio = other["log_ratios"].get(hour)
+        if ratio is None:
+            continue
+        d = other["log_p1"] - target["log_p1"]
+        weight = math.exp(-0.5 * (d / LOCLIN_BANDWIDTH) ** 2)
+        sum_w += weight
+        sum_wd += weight * d
+        sum_wd2 += weight * d * d
+        sum_wy += weight * ratio
+        sum_wdy += weight * d * ratio
+    if sum_w <= 0.0:
+        return None
+    # Normal equations for [intercept, slope], ridge on the slope only.
+    a11 = sum_w
+    a12 = sum_wd
+    a22 = sum_wd2 + 1e-4
+    b1 = sum_wy
+    b2 = sum_wdy
+    det = a11 * a22 - a12 * a12
+    if abs(det) < 1e-12:
+        return b1 / a11
+    return (b1 * a22 - b2 * a12) / det
+
+
+def blend_median(target, pool, hour):
+    """The hour's median log-ratio: 70% local-linear, 30% kernel."""
+    loclin = local_linear_median(target, pool, hour)
+    kernel = kernel_median(target, pool, hour)
+    if loclin is None:
+        return kernel
+    if kernel is None:
+        return loclin
+    return LOCLIN_SHARE * loclin + (1.0 - LOCLIN_SHARE) * kernel
+
+
+def leave_one_out_residuals(pool):
+    """Leave-one-out misses of the blended median, per hour.
+
+    Each past launch is forecast from the rest of the pool, and the miss
+    (actual log-ratio minus forecast median) is kept.  These residuals are
+    what the spread is calibrated from, so no launch ever calibrates its
+    own forecast.
+    """
+    residuals = {hour: [] for hour in range(2, 25)}
+    for index, held in enumerate(pool):
+        others = pool[:index] + pool[index + 1:]
+        target = {"log_p1": held["log_p1"], "hype": held["hype"]}
+        for hour, actual in held["log_ratios"].items():
+            forecast = blend_median(target, others, hour)
+            if forecast is not None:
+                residuals[hour].append((held["log_p1"], actual - forecast))
+    return residuals
+
+
+def calibrated_spread(target, residuals, hour):
+    """Spread of one hour's log-ratio, from similar-scale residuals.
+
+    The standard deviation of the leave-one-out residuals for that hour,
+    weighted toward launches of a similar scale to this case.  Returns
+    None when too few residuals vote.
+    """
+    votes = []
+    for log_p1, residual in residuals.get(hour, []):
+        d = (log_p1 - target["log_p1"]) / RESIDUAL_BANDWIDTH
+        votes.append((residual, math.exp(-0.5 * d * d)))
+    total = sum(w for _, w in votes)
+    if total <= 0.0 or len(votes) < 3:
+        return None
+    mean = sum(r * w for r, w in votes) / total
+    var = sum(w * (r - mean) ** 2 for r, w in votes) / total
+    return max(math.sqrt(max(var, 0.0)), MIN_SPREAD)
+
+
+def pool_spread(target, pool, hour):
+    """Fallback spread: the pool's own weighted spread at that hour."""
+    votes = []
+    for other in pool:
+        ratio = other["log_ratios"].get(hour)
+        if ratio is None:
+            continue
+        weight = kernel_weight(target["log_p1"], target["hype"], other,
+                               KERNEL_BANDWIDTH["size"])
+        if weight > 0.0:
+            votes.append((ratio, weight))
+    if not votes:
+        return None
+    total = sum(w for _, w in votes)
+    mean = sum(v * w for v, w in votes) / total
+    var = sum(w * (v - mean) ** 2 for v, w in votes) / total
+    return max(math.sqrt(max(var, 1e-9)), MIN_SPREAD)
+
+
 def fallback_row(p1, hour):
     """Flat persistence with a wide spread, used when no comparable votes."""
     return [p1 * math.exp(z * FALLBACK_SIGMA * math.sqrt(hour - 1)) for z in Z]
 
 
-def forecast_hour(target, pool, hour):
-    """Five quantiles of one hour's viewers, from the comparable pool.
-
-    Each vote is a comparable's log-ratio for that hour, weighted by how
-    much that launch resembles this case.  The quantiles blend the weighted
-    empirical quantiles with a weighted normal fit, in log space.
-    """
-    votes = []
-    for other in pool:
-        if hour not in other["day"]:
-            continue
-        weight = kernel_weight(target, other)
-        if weight <= 0.0:
-            continue
-        votes.append((math.log(other["day"][hour] / other["p1"]), weight))
-    if not votes:
+def forecast_hour(target, pool, residuals, hour):
+    """Five quantiles of one hour's viewers, from the comparable pool."""
+    median = blend_median(target, pool, hour)
+    if median is None:
         return fallback_row(target["p1"], hour)
-    mean, sd = weighted_mean_sd(votes)
+    spread = calibrated_spread(target, residuals, hour)
+    if spread is None:
+        spread = pool_spread(target, pool, hour)
+    if spread is None:
+        return fallback_row(target["p1"], hour)
     base = math.log(target["p1"])
-    out = []
-    for tau, z in zip(LEVELS, Z):
-        empirical = weighted_quantile(votes, tau)
-        normal = mean + z * sd
-        blended = EMPIRICAL_SHARE * empirical + (1.0 - EMPIRICAL_SHARE) * normal
-        out.append(math.exp(base + blended))
-    return out
+    return [math.exp(base + median + z * spread) for z in Z]
 
 
 def tidy_quantiles(raw):
@@ -312,11 +438,13 @@ def forecast_case(case):
         profile = comparable_profile(comp, case["game"]["name"])
         if profile is not None:
             pool.append(profile)
+    residuals = leave_one_out_residuals(pool) if pool else {}
     hours = []
     for row in case["forecast"]:
         hour = row["hour"]
         hours.append({"hour": hour,
-                      "q": tidy_quantiles(forecast_hour(target, pool, hour))})
+                      "q": tidy_quantiles(forecast_hour(target, pool,
+                                                        residuals, hour))})
     return {"hours": hours}
 
 
